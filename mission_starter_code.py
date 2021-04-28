@@ -1,12 +1,12 @@
 # Uncomment when using the realsense camera
-# import pyrealsense2.pyrealsense2 as rs  # For (most) Linux and Macs
-import pyrealsense2 as rs # For Windows
+import pyrealsense2.pyrealsense2 as rs  # For (most) Linux and Macs
+#import pyrealsense2 as rs # For Windows
 import numpy as np
 import logging
 import time
 import datetime
 import drone_lib
-import fg_camera_sim
+# import fg_camera_sim
 import cv2
 import imutils
 import random
@@ -44,8 +44,11 @@ mission_mode = MISSION_MODE_SEEK
 # x,y center for 640x480 camera resolution.
 FRAME_HORIZONTAL_CENTER = 320.0
 FRAME_VERTICAL_CENTER = 240.0
-FRAME_WIDTH = 640.0
-FRAME_HEIGHT = 480.0
+
+
+# random image
+random_rbg = np.random.randint(255, size=(640, 480, 3), dtype=np.uint8)
+
 
 # Number of frames in a row we need to confirm a suspected target
 REQUIRED_SIGHT_COUNT = 1  # must get 60 target sightings in a row to be sure of actual target
@@ -89,13 +92,18 @@ last_obj_heading = None
 last_point = None  # center point in pixels
 
 # thresholds for detect_annotate
-CONF_THRESH, NMS_THRESH = 0.05,0.3
+CONF_THRESH, NMS_THRESH = 0.05, 0.3
+
+# number of misses
+MAX_MISSES = 60
+
 
 
 # Uncomment below when using actual realsense camera
 # Configure realsense camera stream
-# pipeline = rs.pipeline()
-# config = rs.config()
+pipeline = rs.pipeline()
+config = rs.config()
+
 
 def setup_net():
     in_weights = 'yolov4-tiny-custom_last.weights'
@@ -146,11 +154,11 @@ def clear_path(path):
 
 def start_camera_stream():
     logging.info("configuring rgb stream.")
-    # config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.rgb8, 30)
 
     # Start streaming
     logging.info("Starting camera streams...")
-    # profile = pipeline.start(config)
+    profile = pipeline.start(config)
 
 
 def get_cur_frame(attempts=5, flip_v=False):
@@ -161,24 +169,24 @@ def get_cur_frame(attempts=5, flip_v=False):
     # If using an actual camera, comment out the two lines of
     # code below and replace with code that returns a single frame
     # from your camera.
-    image = fg_camera_sim.get_cur_frame()
-    return cv2.resize(image, (int(FRAME_HORIZONTAL_CENTER * 2), int(FRAME_VERTICAL_CENTER * 2)))
+    # image = fg_camera_sim.get_cur_frame()
+    # return cv2.resize(image, (int(FRAME_HORIZONTAL_CENTER * 2), int(FRAME_VERTICAL_CENTER * 2)))
 
 
     # Code below can be used with the realsense camera...
-    # while tries <= attempts:
-    #     try:
-    #         frames = pipeline.wait_for_frames()
-    #         rgb_frame = frames.get_color_frame()
-    #         rgb_frame = np.asanyarray(rgb_frame.get_data())
-    #
-    #         if flip_v:
-    #             rgb_frame = cv2.flip(rgb_frame, 0)
-    #         return rgb_frame
-    #     except Exception:
-    #         print(Exception)
-    #
-    #     tries += 1
+    while tries <= attempts:
+        try:
+            frames = pipeline.wait_for_frames()
+            rgb_frame = frames.get_color_frame()
+            rgb_frame = np.asanyarray(rgb_frame.get_data())
+
+            if flip_v:
+                rgb_frame = cv2.flip(rgb_frame, 0)
+            return rgb_frame
+        except Exception:
+            print(Exception)
+
+        tries += 1
 
 def get_ground_distance(height, hypotenuse):
 
@@ -208,7 +216,7 @@ def calc_new_location_to_target(from_lat, from_lon, heading, distance):
     return destination.latitude, destination.longitude
 
 
-def detect_annotate(img, net, classes, output_layers):
+def detect_objects(img, net, classes, output_layers):
     cv2.putText(img, 'detecting...', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20,20,230), 2)
 
     blob = cv2.dnn.blobFromImage(img, 0.00392, (192, 192), swapRB=False, crop=False)
@@ -228,40 +236,91 @@ def detect_annotate(img, net, classes, output_layers):
             class_id = np.argmax(scores)
             confidence = scores[class_id]
             if confidence > CONF_THRESH:
-                center_x, center_y, w, h = \
-                    (detection[0:4] * np.array([FRAME_WIDTH, FRAME_HEIGHT, FRAME_WIDTH, FRAME_HEIGHT])).astype('int')
+                # if it is what we're looking for
+                # if classes[class_id] == "people" or classes[class_id] == "pedestrian":
+                if classes[class_id] == "car":
 
-                x = int(center_x - w / 2)
-                y = int(center_y - h / 2)
+                    center_x, center_y, w, h = \
+                        (detection[0:4] * np.array([FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2, FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2])).astype('int')
 
-                b_boxes.append([x, y, int(w), int(h)])
-                confidences.append(float(confidence))
-                class_ids.append(int(class_id))
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
 
-    if len(b_boxes) > 0:
-        # Perform non maximum suppression for the bounding boxes
-        # to filter overlapping and low confidence bounding boxes.
-        indices = cv2.dnn.NMSBoxes(b_boxes, confidences, CONF_THRESH, NMS_THRESH).flatten()
-        for index in indices:
-            x, y, w, h = b_boxes[index]
-            cv2.rectangle(img, (x, y), (x + w, y + h), (20, 20, 230), 2)
-            cv2.putText(img, classes[class_ids[index]], (x + 5, y + 20), cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (20,20,230), 2)
+                    b_boxes.append([x, y, int(w), int(h)])
+                    confidences.append(float(confidence))
+                    class_ids.append(int(class_id))
 
-def check_for_initial_target():
-    frame = get_cur_frame()
+    return b_boxes, confidences
+
+
+def check_for_initial_target(frame, net, classes, output_layers):
+
+    cv2.putText(frame, 'detecting...', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 230), 2)
+
     center = None
     radius = None
     x = y = None
+    confidence = None
 
-    # establish net
-    net, classes, output_layers = setup_net()
-    # detect objects and return center, radius, x, y
-    detect_annotate(frame, net, classes, output_layers)
 
-    return center, radius, (x, y), frame
+    # detect objects and return b_boxes, confidences and class_ids
+    b_boxes, confidences = detect_objects(frame, net, classes, output_layers)
+    # if we found an object
+    if len(b_boxes) >= 1:
+        max_confidence = max(confidences)
+        max_index = confidences.index(max_confidence)
+        # get the values from the best bouding box
+        x, y, w, h = b_boxes[max_index]
+        confidence = confidences[max_index]
+        # calculate center of the object
+        cx = int(x + w / 2)
+        cy = int(y + h / 2)
+
+        radius = max(h, w) + 25
+        center = (cx, cy)
+        # return augmented bounding box
+        return center, radius, (x, y), confidence
+
+    else:
+        return center, radius, (x, y), confidence
 
 def determine_drone_actions(last_point, frame, target_sightings):
     return
+
+def setup_tracker(frame, bbox, radius):
+    tracker = None
+    tracker = cv2.TrackerCSRT_create()
+
+    new_bbox = (bbox[0], bbox[1], radius, radius)
+    success = tracker.init(frame, new_bbox)
+    return success, tracker
+
+def confirm_target_bbox(frame, b_box, net, classes, output_layers):
+    blank_image = random_rbg.copy()
+    x = int(b_box[0])
+    y = int(b_box[1])
+    w = int(b_box[2])
+    h = int(b_box[3])
+
+    if w <= 0 or h <= 0:
+        return False
+
+    cx = int(x + w / 2)
+    cy  = int(y + h / 2)
+    cr = int(max(w, h) / 2)
+
+    cropped = frame[cy - cr:cy + cr, cx - cr:cx + cr]
+    blank_image[y:y + cropped.shape[0], x:x + cropped.shape[1]] = cropped
+
+    cv2.imshow("cropped", blank_image)
+
+    center, radius, (x, y), confidence = check_for_initial_target(frame, net, classes, output_layers)
+
+    if confidence is not None \
+        and confidence > .2:
+        return True
+    else:
+        return False
 
 def conduct_mission():
     # Here, we will loop until we find a human target and deliver the care package,
@@ -271,13 +330,24 @@ def conduct_mission():
     target_sightings = 0
     global counter, mission_mode, last_point, last_obj_lon, \
         last_obj_lat, last_obj_alt, \
-        last_obj_heading, target_circle_radius
+        last_obj_heading, target_circle_radius, object_tracking
+
+    object_tracking = False
+
+    net, classes, output_layers = setup_net()
 
     logging.info("Starting camera feed...")
     start_camera_stream()
+    center = None
+    radius = None
+    b_box = None
+    confidence = None
+    tracker = None
+    tracker_misses = 0
 
     while drone.armed:  # While the drone's mission is executing...
 
+        # if manual override or mission is done
         if drone.mode == "RTL":
             mission_mode = MISSION_MODE_RTL
             logging.info("RTL mode activated.  Mission ended.")
@@ -290,65 +360,51 @@ def conduct_mission():
         last_alt = location.alt
         last_heading = drone.heading
 
-        # look for a target in current frame
-        center, radius, (x, y), frame = check_for_initial_target()
+        frame = get_cur_frame()
+        frame_copy = frame.copy()
 
-        if center is not None:
+        # if not tracking
+        if not object_tracking:
+            # get initial object
+            center, radius, b_box, confidence = check_for_initial_target(frame_copy, net, classes, output_layers)
+            if confidence is not None and confidence > 0.2:
+                # draw bounding box on things
+                x = int(b_box[0])
+                y = int(b_box[1])
+                cv2.rectangle(frame, (x, y), (x + radius, y + radius), (20, 20, 230), 2)
 
-            logging.info(f"(Potential) target acquired @"
-                         f"({center[0], center[1]}) with radius {radius}.")
-
-            target_sightings += 1
-
-            # We're looking for a person/pedestrian...
-            last_point = center
-
-            if mission_mode == MISSION_MODE_SEEK:
-                logging.info(f"Locking in on lat {last_lat}, lon {last_lon}, "
-                             f"alt {last_alt}, heading {last_heading}.")
-
-                last_obj_lon = last_lon
-                last_obj_lat = last_lat
-                last_obj_alt = last_alt
-                last_obj_heading = last_heading
-
-            # TODO: draw bounding box around potential target in the current frame...
-
-
+                # send to object tracker
+                object_tracking = True
+                success, tracker = setup_tracker(frame, b_box, radius)
         else:
-            # We have no target in the current frame.
-            logging.info("No target found; continuing search...")
-            cv2.putText(frame, "Scanning for target...", (10, 400), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
-            target_sightings = 0  # reset target sighting
-            last_point = None
+            success, b_box = tracker.update(frame_copy)
+            success = confirm_target_bbox(frame_copy, b_box, net, classes, output_layers)
 
-        # Time to adjust drone's position?
-        if (counter % UPDATE_RATE) == 0 \
-                or mission_mode != MISSION_MODE_SEEK:
-            # determine drone's next actions (if any)
-            determine_drone_actions(last_point, frame, target_sightings)
+            # confirm bounding box
+            if success:
+                x = int(b_box[0])
+                y = int(b_box[1])
+                cv2.rectangle(frame, (x, y), (x + int(b_box[2]), y + int(b_box[3])),
+                              (255, 0, 0), 2, 1)
+                tracker_misses = 0
+            else:
+                tracker_misses += 1
+            # if we miss the target 60 times in a row stop detecting
+            if tracker_misses >= MAX_MISSES:
+                object_tracking = False
+                tracker = None
 
-        # Display information in windowed frame:
-        cv2.putText(frame, direction1, (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(frame, direction2, (10, 60), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
-
-        # Draw (blue) marker in center of frame that indicates the
-        # drone's relative position to the target
-        # (assuming camera is centered under the drone).
-        cv2.circle(frame,
-                   (int(FRAME_HORIZONTAL_CENTER), int(FRAME_VERTICAL_CENTER)),
-                   10, (255, 0, 0), -1)
-
+        cv2.imshow("Detecting", frame)
         # Now, show stats for informational purposes only
         # cv2.imshow("Real-time Detect", frame)
-        if (counter % IMG_WRITE_RATE) == 0:
-            cv2.imwrite(f"{IMG_SNAPSHOT_PATH}/frm_{counter}.png", frame)
+        # if (counter % IMG_WRITE_RATE) == 0:
+        #     cv2.imwrite(f"{IMG_SNAPSHOT_PATH}/frm_{counter}.png", frame)
 
-        # key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
 
         # if the `q` key was pressed, break from the loop
-        # if key == ord("q"):
-        #    break
+        if key == ord("q"):
+            break
 
         if mission_mode == MISSION_MODE_RTL:
             break  # mission is over.
@@ -360,7 +416,7 @@ def main():
     global log
 
     # Setup a log file for recording important activities during our session.
-    log_file = time.strftime("TEAM_NAME_PEX03_%Y%m%d-%H%M%S") + ".log"
+    log_file = time.strftime("KIRK_DURAN_PEX03_%Y%m%d-%H%M%S") + ".log"
 
     # prepare log file...
     handlers = [logging.FileHandler(log_file), logging.StreamHandler()]
@@ -402,7 +458,7 @@ def main():
         log.info("backing up old images...")
 
         # Backup any previous images and create new empty folder for current experiment.
-        backup_prev_experiment(IMG_SNAPSHOT_PATH)
+        # backup_prev_experiment(IMG_SNAPSHOT_PATH)
 
         # Now, look for target...
         conduct_mission()
@@ -412,6 +468,7 @@ def main():
         drone.armed = False
         drone.close()
         log.info("End of demonstration.")
+        pipeline.stop()
     except Exception as e:
         log.info(f"Program exception: {traceback.format_exception(*sys.exc_info())}")
         raise
