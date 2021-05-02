@@ -96,7 +96,7 @@ last_point = None  # center point in pixels
 CONF_THRESH, NMS_THRESH = 0.05, 0.3
 
 # number of misses
-MAX_MISSES = 10
+MAX_MISSES = 35
 tracker_misses = 0
 tracker = None
 
@@ -198,7 +198,7 @@ def get_cur_frame(attempts=5, flip_v=False):
         return None
 
 
-def get_ground_distance(height, hypotenuse):
+def get_ground_distance(hypotenuse):
 
     import math
 
@@ -207,10 +207,10 @@ def get_ground_distance(height, hypotenuse):
     # by using the simple formula of:
     # d^2 = hypotenuse^2 - height^2
 
-    return math.sqrt(hypotenuse**2 - height**2)
+    return math.sin(math.radians(45)) * hypotenuse
 
 
-def calc_new_location_to_target(from_lat, from_lon, heading, distance):
+def calc_new_location_to_target(from_lat, from_lon, heading, drone_distance):
 
     from geopy import distance
     from geopy import Point
@@ -220,8 +220,10 @@ def calc_new_location_to_target(from_lat, from_lon, heading, distance):
     #        distance from current location (in meters)
 
     origin = Point(from_lat, from_lon)
+    # destination = distance.distance(
+    #     kilometers=(distance*.001)).destination(origin, heading)
     destination = distance.distance(
-        kilometers=(distance*.001)).destination(origin, heading)
+        kilometers=(drone_distance*.001)).destination(origin, heading)
 
     return destination.latitude, destination.longitude
 
@@ -248,7 +250,7 @@ def detect_objects(img):
             if confidence > CONF_THRESH:
                 # if it is what we're looking for
                 # if classes[class_id] == "people" or classes[class_id] == "pedestrian":
-                if classes[class_id] == "car":
+                if classes[class_id] == "van":
 
                     center_x, center_y, w, h = \
                         (detection[0:4] * np.array([FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2, FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2])).astype('int')
@@ -431,11 +433,43 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
     else:
         return False, None
 
-# def landing_sequence(widths, alts, lats, longs):
-#     distances = []
-#     for i in len(widths):
 
+def landing_sequence(widths, alts, lats, longs, headings):
 
+    sum_distance = 0
+    assumed_width = 1.0 # in meters
+    ratio = 0.01807 / 4
+
+    # calculate ground distances for each width
+    for width in widths:
+        # formula for distance assumed width is 1 meter
+        hypotenuse = (7.62 * assumed_width) / (width * ratio)
+        distance = get_ground_distance(hypotenuse) - 1
+        sum_distance += distance
+        print("distance: ")
+        print(distance)
+
+    # calculate final distance in meters
+    final_distance = sum_distance / len(widths)
+    print("final distance: ")
+    print(final_distance)
+
+    # find last lat and long and heading
+    lat = lats[len(lats) - 1]
+    long = longs[len(longs) - 1]
+    heading = headings[len(headings) - 1]
+
+    # calculate final lat and long
+    final_lat, final_long = calc_new_location_to_target(lat, long, heading, final_distance)
+    # hover over to the point
+    drone_lib.goto_point(drone, final_lat, final_long, 0.5, alts[len(alts) - 1], log=log)
+    # wait to stop moving
+    time.sleep(1)
+    # go down to 1.5 meters and release eggs
+    drone_lib.goto_point(drone, final_lat, final_long, 0.2, 1.5, log=log)
+    release_grip(2)
+    # go home
+    drone_lib.change_device_mode(drone, "RTL", log=log)
 
 
 def conduct_mission():
@@ -544,7 +578,8 @@ def conduct_mission():
                         print(lats)
                         print(longs)
                         print(headings)
-                        drone_lib.change_device_mode(drone, "RTL", log=log)
+                        landing_sequence(widths, alts, lats, longs, headings)
+
                 tracker_misses = 0
             else:
                 # reset centers and miss counters
