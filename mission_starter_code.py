@@ -44,10 +44,11 @@ mission_mode = MISSION_MODE_SEEK
 # x,y center for 640x480 camera resolution.
 FRAME_HORIZONTAL_CENTER = 320.0
 FRAME_VERTICAL_CENTER = 240.0
-
+FRAME_HEIGHT = int(480)
+FRAME_WIDTH = int(640)
 
 # random image
-random_rbg = np.random.randint(255, size=(640, 480, 3), dtype=np.uint8)
+random_rbg = np.random.randint(0, 256, size=(FRAME_HEIGHT, FRAME_WIDTH, 3)).astype('uint8')
 
 
 # Number of frames in a row we need to confirm a suspected target
@@ -82,7 +83,7 @@ inside_circle = False
 target_locate_attempts = 0
 
 # Holds the size of a potential target's radius
-target_circle_radius = 0
+target_circle_radius = 10
 
 # info related to last (potential) target sighting
 last_obj_lon = None
@@ -95,17 +96,24 @@ last_point = None  # center point in pixels
 CONF_THRESH, NMS_THRESH = 0.05, 0.3
 
 # number of misses
-MAX_MISSES = 60
-
-
+MAX_MISSES = 10
+tracker_misses = 0
+tracker = None
 
 # Uncomment below when using actual realsense camera
 # Configure realsense camera stream
 pipeline = rs.pipeline()
 config = rs.config()
 
+# net setup
+net = None
+classes = None
+output_layers = None
+
 
 def setup_net():
+    global net, output_layers, classes
+
     in_weights = 'yolov4-tiny-custom_last.weights'
     in_config = 'yolov4-tiny-custom.cfg'
     name_file = 'custom.names'
@@ -119,8 +127,6 @@ def setup_net():
     layers = net.getLayerNames()
     output_layers = [layers[i[0] - 1] for i in net.getUnconnectedOutLayers()]
 
-    return net, classes, output_layers
-
 
 def release_grip(seconds=2):
     sec=1
@@ -129,6 +135,7 @@ def release_grip(seconds=2):
         override_gripper_state(GRIPPER_OPEN)
         time.sleep(1)
         sec += 1
+
 
 def override_gripper_state(state=GRIPPER_CLOSED):
     global gripper_state
@@ -171,7 +178,7 @@ def get_cur_frame(attempts=5, flip_v=False):
     # from your camera.
     # image = fg_camera_sim.get_cur_frame()
     # return cv2.resize(image, (int(FRAME_HORIZONTAL_CENTER * 2), int(FRAME_VERTICAL_CENTER * 2)))
-
+    rgb_frame = None
 
     # Code below can be used with the realsense camera...
     while tries <= attempts:
@@ -187,6 +194,9 @@ def get_cur_frame(attempts=5, flip_v=False):
             print(Exception)
 
         tries += 1
+    if rgb_frame is None:
+        return None
+
 
 def get_ground_distance(height, hypotenuse):
 
@@ -216,7 +226,7 @@ def calc_new_location_to_target(from_lat, from_lon, heading, distance):
     return destination.latitude, destination.longitude
 
 
-def detect_objects(img, net, classes, output_layers):
+def detect_objects(img):
     cv2.putText(img, 'detecting...', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20,20,230), 2)
 
     blob = cv2.dnn.blobFromImage(img, 0.00392, (192, 192), swapRB=False, crop=False)
@@ -253,7 +263,7 @@ def detect_objects(img, net, classes, output_layers):
     return b_boxes, confidences
 
 
-def check_for_initial_target(frame, net, classes, output_layers):
+def check_for_initial_target(frame):
 
     cv2.putText(frame, 'detecting...', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 230), 2)
 
@@ -262,14 +272,13 @@ def check_for_initial_target(frame, net, classes, output_layers):
     x = y = None
     confidence = None
 
-
     # detect objects and return b_boxes, confidences and class_ids
-    b_boxes, confidences = detect_objects(frame, net, classes, output_layers)
+    b_boxes, confidences = detect_objects(frame)
     # if we found an object
     if len(b_boxes) >= 1:
         max_confidence = max(confidences)
         max_index = confidences.index(max_confidence)
-        # get the values from the best bouding box
+        # get the values from the best bounding box
         x, y, w, h = b_boxes[max_index]
         confidence = confidences[max_index]
         # calculate center of the object
@@ -284,8 +293,100 @@ def check_for_initial_target(frame, net, classes, output_layers):
     else:
         return center, radius, (x, y), confidence
 
-def determine_drone_actions(last_point, frame, target_sightings):
-    return
+
+def determine_drone_actions(target_point, frame, target_sightings):
+    global mission_mode, target_locate_attempts
+    global direction1, direction2
+    global target_circle_radius, inside_circle
+    global last_obj_lon, last_obj_lat, last_obj_alt, last_obj_heading
+
+    y_movement = 0.0
+    x_movement = 0.0
+
+    # Now, lets calculate our drone's actions according to what we have found...
+    if target_point is not None:
+
+        # dx = float(target_point's x position)- frame's horizontal center
+        # dy = frame's vertical center -float(target_point's y position)
+        dx = float(target_point[0]) - FRAME_HORIZONTAL_CENTER
+        dy = FRAME_VERTICAL_CENTER - float(target_point[1])
+
+        logging.info(f"Anticipated change in position towards target: dx={dx}, dy={dy}")
+
+
+        # Check to see if we're inside our safe zone relative to target...
+        if (int(target_point[0]) - FRAME_HORIZONTAL_CENTER) ** 2 \
+                + (int(target_point[1]) - FRAME_VERTICAL_CENTER) ** 2 \
+                < target_circle_radius ** 2:
+
+            inside_circle = True
+        else:
+            inside_circle = False
+
+        centered_hor = False
+        centered_ver = False
+        # if we're inside the circle return centered for calculations
+        if inside_circle:
+            print("centered")
+            return True
+        # if not move the drone
+        else:
+            if dx < 0:  # left
+                # do what?  negative direction...
+                if abs(dx) < 50:
+                    x_movement = -0.2
+                else:
+                    x_movement = -0.5
+                direction1 = "Need to go Left"
+                # pass  # (REMOVE 'pass' when you have supplied actual code)
+            if dx > 0:  # right
+                # do what?  positive direction...
+                if abs(dx) < 50:
+                    x_movement = 0.2
+                else:
+                    x_movement = 0.5
+                direction1 = "Need to go Right"
+                # pass
+            if dy < 0:  # back
+                # do what?  positive direction...
+                if abs(dy) < 50:
+                    y_movement = 0.2
+                else:
+                    y_movement = 0.5
+                direction2 = "Need to go Back"
+                # pass
+            if dy > 0:  # forward
+                if abs(dy) < 50:
+                    y_movement = -0.2
+                else:
+                    y_movement = -0.5
+                direction2 = "Need to move Forward"
+                # do what?  negative direction...
+                # pass
+            if abs(dx) < 7:  # if we are within 8 pixels, no need to make adjustment
+                x_movement = 0.0
+                direction1 = "Horizontal Center!"
+                centered_hor = True
+            if abs(dy) < 7:  # if we are within 8 pixels, no need to make adjustment
+                y_movement = 0.0
+                direction2 = "Vertical Center!"
+                centered_ver = True
+            # if within 7 pixels take calculations
+            if centered_ver and centered_hor:
+                print("centered")
+                return True
+            # else move the drone return not centered
+            if x_movement > 0.0:
+                drone_lib.small_move_right(drone, x_movement)
+            else:
+                drone_lib.small_move_left(drone, abs(x_movement))
+            if y_movement > 0.0:
+                drone_lib.small_move_back(drone, y_movement)
+            else:
+                drone_lib.small_move_forward(drone, abs(y_movement))
+            return False
+
+
 
 def setup_tracker(frame, bbox, radius):
     tracker = None
@@ -295,7 +396,9 @@ def setup_tracker(frame, bbox, radius):
     success = tracker.init(frame, new_bbox)
     return success, tracker
 
+
 def confirm_target_bbox(frame, b_box, net, classes, output_layers):
+    center = None
     blank_image = random_rbg.copy()
     x = int(b_box[0])
     y = int(b_box[1])
@@ -303,10 +406,10 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
     h = int(b_box[3])
 
     if w <= 0 or h <= 0:
-        return False
+        return False, None
 
     cx = int(x + w / 2)
-    cy  = int(y + h / 2)
+    cy = int(y + h / 2)
     cr = int(max(w, h) / 2)
 
     cropped = frame[cy - cr:cy + cr, cx - cr:cx + cr]
@@ -314,13 +417,26 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
 
     cv2.imshow("cropped", blank_image)
 
-    center, radius, (x, y), confidence = check_for_initial_target(frame, net, classes, output_layers)
+    center, radius, (x, y), confidence = check_for_initial_target(blank_image)
+    print(confidence)
 
-    if confidence is not None \
-        and confidence > .2:
-        return True
+    if confidence is not None and confidence > .2:
+        x = int(b_box[0])
+        y = int(b_box[1])
+        center_x = x + int(b_box[2] / 2)
+        center_y = y + int(b_box[3] / 2)
+        cv2.rectangle(frame, (x, y), (x + int(b_box[2]), y + int(b_box[3])),
+                      (255, 0, 0), 2, 1)
+        return True, (center_x, center_y)
     else:
-        return False
+        return False, None
+
+# def landing_sequence(widths, alts, lats, longs):
+#     distances = []
+#     for i in len(widths):
+
+
+
 
 def conduct_mission():
     # Here, we will loop until we find a human target and deliver the care package,
@@ -330,11 +446,12 @@ def conduct_mission():
     target_sightings = 0
     global counter, mission_mode, last_point, last_obj_lon, \
         last_obj_lat, last_obj_alt, \
-        last_obj_heading, target_circle_radius, object_tracking
+        last_obj_heading, target_circle_radius, object_tracking, \
+        tracker_misses, tracker
 
     object_tracking = False
 
-    net, classes, output_layers = setup_net()
+    setup_net()
 
     logging.info("Starting camera feed...")
     start_camera_stream()
@@ -344,6 +461,12 @@ def conduct_mission():
     confidence = None
     tracker = None
     tracker_misses = 0
+    tracker_centers = 0
+    widths = []
+    alts = []
+    lats = []
+    longs = []
+    headings = []
 
     while drone.armed:  # While the drone's mission is executing...
 
@@ -361,12 +484,19 @@ def conduct_mission():
         last_heading = drone.heading
 
         frame = get_cur_frame()
-        frame_copy = frame.copy()
 
+        # if rs camera is not working
+        if frame is None:
+            logging.info("Real Sense camera didn't load frames")
+            drone_lib.change_device_mode(drone, "RTL", log=log)
+            break
+
+        frame_copy = frame.copy()
+        cv2.circle(frame, (int(FRAME_HORIZONTAL_CENTER), int(FRAME_VERTICAL_CENTER)), int(target_circle_radius), (255, 255, 0), 2)
         # if not tracking
         if not object_tracking:
             # get initial object
-            center, radius, b_box, confidence = check_for_initial_target(frame_copy, net, classes, output_layers)
+            center, radius, b_box, confidence = check_for_initial_target(frame_copy)
             if confidence is not None and confidence > 0.2:
                 # draw bounding box on things
                 x = int(b_box[0])
@@ -378,19 +508,58 @@ def conduct_mission():
                 success, tracker = setup_tracker(frame, b_box, radius)
         else:
             success, b_box = tracker.update(frame_copy)
-            success = confirm_target_bbox(frame_copy, b_box, net, classes, output_layers)
-
-            # confirm bounding box
+            success, last_point = confirm_target_bbox(frame_copy, b_box, net, classes, output_layers)
+            # record width
+            width = b_box[2]
+            # if still tracking, move drone into guided mode and adjust until centered
             if success:
-                x = int(b_box[0])
-                y = int(b_box[1])
-                cv2.rectangle(frame, (x, y), (x + int(b_box[2]), y + int(b_box[3])),
-                              (255, 0, 0), 2, 1)
+                drone_lib.change_device_mode(drone, "GUIDED", log=log)
+                centered = determine_drone_actions(last_point, frame, target_sightings)
+
+                # wait for the drone to finish movement
+                if not centered:
+                    # Display information in windowed frame:
+                    cv2.putText(frame, direction1, (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, direction2, (10, 60), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    # reset counter and alt and width records
+                    tracker_centers = 0
+                    widths.clear()
+                    alts.clear()
+                    lats.clear()
+                    longs.clear()
+                    headings.clear()
+                else:
+                    # wait for 7 consecutive centers and record info for new lat long
+                    cv2.putText(frame, "centered", (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    tracker_centers += 1
+                    widths.append(width)
+                    alts.append(last_alt)
+                    lats.append(last_lat)
+                    longs.append(last_lon)
+                    headings.append(last_heading)
+                    # want 7 confirmations
+                    if tracker_centers >= 7:
+                        print(widths)
+                        print(alts)
+                        print(lats)
+                        print(longs)
+                        print(headings)
+                        drone_lib.change_device_mode(drone, "RTL", log=log)
                 tracker_misses = 0
             else:
+                # reset centers and miss counters
+                widths.clear()
+                alts.clear()
+                lats.clear()
+                longs.clear()
+                headings.clear()
                 tracker_misses += 1
-            # if we miss the target 60 times in a row stop detecting
+                tracker_centers = 0
+
+            # if we miss the target 60 times in a row stop detecting send it back into auto
             if tracker_misses >= MAX_MISSES:
+                print("lost target")
+                drone_lib.change_device_mode(drone, "AUTO", log=log)
                 object_tracking = False
                 tracker = None
 
@@ -404,6 +573,7 @@ def conduct_mission():
 
         # if the `q` key was pressed, break from the loop
         if key == ord("q"):
+            drone_lib.change_device_mode(drone, "RTL", log=log)
             break
 
         if mission_mode == MISSION_MODE_RTL:
