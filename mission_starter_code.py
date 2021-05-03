@@ -23,7 +23,7 @@ GRIPPER_OPEN = 1087
 GRIPPER_CLOSED = 1940
 gripper_state = GRIPPER_CLOSED # assume gripper is closed by default
 
-IMG_SNAPSHOT_PATH = '/dev/drone_data/mission_data/cam_pex003'
+IMG_SNAPSHOT_PATH = 'mission_data/KIRK_DURAN_pex003'
 IMG_WRITE_RATE = 10  # write every 10 frames to disk...
 
 # Various mission states:
@@ -58,9 +58,6 @@ REQUIRED_SIGHT_COUNT = 1  # must get 60 target sightings in a row to be sure of 
 COLOR_RANGE_MIN = (110, 100, 75)
 COLOR_RANGE_MAX = (160, 255, 255)
 
-# Blue (ish) target
-# COLOR_RANGE_MIN = (80, 50, 50)
-# COLOR_RANGE_MAX = (105, 255, 255)
 
 # Smallest object radius to consider (in pixels)
 MIN_OBJ_RADIUS = 10
@@ -82,8 +79,6 @@ inside_circle = False
 # tracks number of attempts to re-acquire a target (if lost)
 target_locate_attempts = 0
 
-# Holds the size of a potential target's radius
-target_circle_radius = 10
 
 # info related to last (potential) target sighting
 last_obj_lon = None
@@ -96,7 +91,6 @@ last_point = None  # center point in pixels
 CONF_THRESH, NMS_THRESH = 0.05, 0.3
 
 # number of misses
-MAX_MISSES = 35
 tracker_misses = 0
 tracker = None
 
@@ -110,6 +104,17 @@ net = None
 classes = None
 output_layers = None
 
+# variables to modify in the field
+target_circle_radius = 17
+DRONE_ANGLE = 45
+CENTERS_REQ = 1
+ASSUMED_WIDTH_MOD = 4
+DISTANCE_SUB = 3
+MAX_MISSES = 10
+DROP_ALT = 3.2
+VIRTUAL = False
+range_finder_dist = None
+tracker_class = "van"
 
 def setup_net():
     global net, output_layers, classes
@@ -207,7 +212,7 @@ def get_ground_distance(hypotenuse):
     # by using the simple formula of:
     # d^2 = hypotenuse^2 - height^2
 
-    return math.sin(math.radians(45)) * hypotenuse
+    return math.sin(math.radians(DRONE_ANGLE)) * hypotenuse
 
 
 def calc_new_location_to_target(from_lat, from_lon, heading, drone_distance):
@@ -250,7 +255,7 @@ def detect_objects(img):
             if confidence > CONF_THRESH:
                 # if it is what we're looking for
                 # if classes[class_id] == "people" or classes[class_id] == "pedestrian":
-                if classes[class_id] == "van":
+                if classes[class_id] == tracker_class:
 
                     center_x, center_y, w, h = \
                         (detection[0:4] * np.array([FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2, FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2])).astype('int')
@@ -329,7 +334,7 @@ def determine_drone_actions(target_point, frame, target_sightings):
         centered_ver = False
         # if we're inside the circle return centered for calculations
         if inside_circle:
-            print("centered")
+            drone_lib.log_activity("Drone centered", log=log)
             return True
         # if not move the drone
         else:
@@ -375,17 +380,19 @@ def determine_drone_actions(target_point, frame, target_sightings):
                 centered_ver = True
             # if within 7 pixels take calculations
             if centered_ver and centered_hor:
-                print("centered")
+                drone_lib.log_activity("Drone centered", log=log)
                 return True
             # else move the drone return not centered
             if x_movement > 0.0:
                 drone_lib.small_move_right(drone, x_movement)
             else:
                 drone_lib.small_move_left(drone, abs(x_movement))
+            time.sleep(1)
             if y_movement > 0.0:
                 drone_lib.small_move_back(drone, y_movement)
             else:
                 drone_lib.small_move_forward(drone, abs(y_movement))
+            time.sleep(1)
             return False
 
 
@@ -417,57 +424,96 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
     cropped = frame[cy - cr:cy + cr, cx - cr:cx + cr]
     blank_image[y:y + cropped.shape[0], x:x + cropped.shape[1]] = cropped
 
-    cv2.imshow("cropped", blank_image)
+    if VIRTUAL:
+        cv2.imshow("cropped", blank_image)
 
     center, radius, (x, y), confidence = check_for_initial_target(blank_image)
-    print(confidence)
+    drone_lib.log_activity(f"Current confidence: {confidence}", log=log)
 
+    x = int(b_box[0])
+    y = int(b_box[1])
+    center_x = x + int(b_box[2] / 2)
+    center_y = y + int(b_box[3] / 2)
     if confidence is not None and confidence > .2:
-        x = int(b_box[0])
-        y = int(b_box[1])
-        center_x = x + int(b_box[2] / 2)
-        center_y = y + int(b_box[3] / 2)
+
         cv2.rectangle(frame, (x, y), (x + int(b_box[2]), y + int(b_box[3])),
                       (255, 0, 0), 2, 1)
         return True, (center_x, center_y)
     else:
-        return False, None
+        return False, (center_x, center_y)
 
 
-def landing_sequence(widths, alts, lats, longs, headings):
-
+def pixel_distance(widths):
     sum_distance = 0
-    assumed_width = 1.0 # in meters
-    ratio = 0.01807 / 4
+    # assumed width of target in meters
+    assumed_width = 1.0 * ASSUMED_WIDTH_MOD
+    # adjust for car/van
+    ratio = 0.01807
 
     # calculate ground distances for each width
     for width in widths:
         # formula for distance assumed width is 1 meter
         hypotenuse = (7.62 * assumed_width) / (width * ratio)
-        distance = get_ground_distance(hypotenuse) - 1
+        distance = get_ground_distance(hypotenuse) - DISTANCE_SUB
         sum_distance += distance
-        print("distance: ")
-        print(distance)
 
     # calculate final distance in meters
     final_distance = sum_distance / len(widths)
-    print("final distance: ")
-    print(final_distance)
+    return final_distance
+
+
+def range_finder_distance():
+    distance = drone.rangefinder.distance
+    if distance is None:
+        return None
+    ground_distance = get_ground_distance(distance)
+    return ground_distance
+
+
+def drop_off_sequence(lat, long, alt):
+    # hover over to the point
+    drone_lib.goto_point(drone, lat, long, 0.5, alt, log=log)
+    # wait to stop moving
+    time.sleep(1)
+
+    # go down to 1.5 meters and release eggs
+    drone_lib.log_activity(f"Lowering to: {DROP_ALT}", log=log)
+    drone_lib.goto_point(drone, lat, long, 0.2, DROP_ALT, log=log)
+
+    drone_lib.log_activity("Dropping off package", log=log)
+    release_grip(2)
+
+
+def landing_sequence(widths, alts, lats, longs, headings):
+
+    # calculate final distance using pixel
+    final_distance = pixel_distance(widths)
+
+    # if pixel calculations fail
+    if range_finder_dist is not None:
+        if range_finder_dist > 0.0:
+            final_distance = range_finder_dist
+
+    # if both fail estimate
+    if final_distance <= 0.0:
+        final_distance = alts[0] * 1.25
+
+    drone_lib.log_activity(f"final ground distance calculated: {final_distance}", log=log)
 
     # find last lat and long and heading
     lat = lats[len(lats) - 1]
     long = longs[len(longs) - 1]
     heading = headings[len(headings) - 1]
 
+    drone_lib.log_activity("Going in for landing", log=log)
+
+
     # calculate final lat and long
     final_lat, final_long = calc_new_location_to_target(lat, long, heading, final_distance)
-    # hover over to the point
-    drone_lib.goto_point(drone, final_lat, final_long, 0.5, alts[len(alts) - 1], log=log)
-    # wait to stop moving
-    time.sleep(1)
-    # go down to 1.5 meters and release eggs
-    drone_lib.goto_point(drone, final_lat, final_long, 0.2, 1.5, log=log)
-    release_grip(2)
+
+    # drop off sequence
+    drop_off_sequence(final_lat, final_long, alts[0])
+
     # go home
     drone_lib.change_device_mode(drone, "RTL", log=log)
 
@@ -481,7 +527,7 @@ def conduct_mission():
     global counter, mission_mode, last_point, last_obj_lon, \
         last_obj_lat, last_obj_alt, \
         last_obj_heading, target_circle_radius, object_tracking, \
-        tracker_misses, tracker
+        tracker_misses, tracker, range_finder_dist
 
     object_tracking = False
 
@@ -537,7 +583,9 @@ def conduct_mission():
                 y = int(b_box[1])
                 cv2.rectangle(frame, (x, y), (x + radius, y + radius), (20, 20, 230), 2)
 
-                # send to object tracker
+                # send to object tracker and change to guided mode
+                drone_lib.log_activity("Found target", log=log)
+                drone_lib.change_device_mode(drone, "GUIDED", log=log)
                 object_tracking = True
                 success, tracker = setup_tracker(frame, b_box, radius)
         else:
@@ -545,16 +593,16 @@ def conduct_mission():
             success, last_point = confirm_target_bbox(frame_copy, b_box, net, classes, output_layers)
             # record width
             width = b_box[2]
-            # if still tracking, move drone into guided mode and adjust until centered
+            # if still tracking, mode and adjust until centered
             if success:
-                drone_lib.change_device_mode(drone, "GUIDED", log=log)
                 centered = determine_drone_actions(last_point, frame, target_sightings)
 
                 # wait for the drone to finish movement
                 if not centered:
-                    # Display information in windowed frame:
-                    cv2.putText(frame, direction1, (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
-                    cv2.putText(frame, direction2, (10, 60), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    if VIRTUAL:
+                        # Display information in windowed frame:
+                        cv2.putText(frame, direction1, (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, direction2, (10, 60), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
                     # reset counter and alt and width records
                     tracker_centers = 0
                     widths.clear()
@@ -563,22 +611,27 @@ def conduct_mission():
                     longs.clear()
                     headings.clear()
                 else:
+                    # calculate range finder distance
+                    if not VIRTUAL:
+                        range_finder_dist = range_finder_distance()
+
                     # wait for 7 consecutive centers and record info for new lat long
-                    cv2.putText(frame, "centered", (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                    if VIRTUAL:
+                        cv2.putText(frame, "centered", (10, 30), font, 1, (255, 0, 0), 2, cv2.LINE_AA)
                     tracker_centers += 1
                     widths.append(width)
                     alts.append(last_alt)
                     lats.append(last_lat)
                     longs.append(last_lon)
                     headings.append(last_heading)
-                    # want 7 confirmations
-                    if tracker_centers >= 7:
-                        print(widths)
-                        print(alts)
-                        print(lats)
-                        print(longs)
-                        print(headings)
-                        landing_sequence(widths, alts, lats, longs, headings)
+                # want 1 centers
+                if tracker_centers >= CENTERS_REQ:
+                    drone_lib.log_activity(f"widths calculated: {widths}", log=log)
+                    drone_lib.log_activity(f"last alts: {alts}", log=log)
+                    drone_lib.log_activity(f"last lats: {lats}", log=log)
+                    drone_lib.log_activity(f"last longs: {lats}", log=log)
+                    drone_lib.log_activity(f"last headings: {headings}", log=log)
+                    landing_sequence(widths, alts, lats, longs, headings)
 
                 tracker_misses = 0
             else:
@@ -593,16 +646,21 @@ def conduct_mission():
 
             # if we miss the target 60 times in a row stop detecting send it back into auto
             if tracker_misses >= MAX_MISSES:
-                print("lost target")
+                drone_lib.log_activity("Lost target", log=log)
                 drone_lib.change_device_mode(drone, "AUTO", log=log)
+                time.sleep(2)
                 object_tracking = False
                 tracker = None
+                tracker_misses = 0
 
-        cv2.imshow("Detecting", frame)
+        # if virtual show frame
+        if VIRTUAL:
+            cv2.imshow("Detecting", frame)
+
         # Now, show stats for informational purposes only
-        # cv2.imshow("Real-time Detect", frame)
-        # if (counter % IMG_WRITE_RATE) == 0:
-        #     cv2.imwrite(f"{IMG_SNAPSHOT_PATH}/frm_{counter}.png", frame)
+        if (counter % IMG_WRITE_RATE) == 0:
+            image_name = f"frm_{counter}.png"
+            cv2.imwrite(os.path.join(IMG_SNAPSHOT_PATH, image_name), frame)
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -632,7 +690,9 @@ def main():
     log.info("PEX 03 start.")
 
     # Connect to the autopilot
+
     drone = drone_lib.connect_device("127.0.0.1:14550", log=log)
+
     # drone = drone_lib.connect_device("/dev/ttyACM0", baud=115200, log=log)
 
     # Create a message listener using the decorator.
@@ -663,7 +723,7 @@ def main():
         log.info("backing up old images...")
 
         # Backup any previous images and create new empty folder for current experiment.
-        # backup_prev_experiment(IMG_SNAPSHOT_PATH)
+        backup_prev_experiment(IMG_SNAPSHOT_PATH)
 
         # Now, look for target...
         conduct_mission()
