@@ -104,17 +104,23 @@ net = None
 classes = None
 output_layers = None
 
+# person's calculated location
+dummy_lat = None
+dummy_long = None
+
 # variables to modify in the field
 target_circle_radius = 17
 DRONE_ANGLE = 45
 CENTERS_REQ = 1
 ASSUMED_WIDTH_MOD = 4
 DISTANCE_SUB = 3
-MAX_MISSES = 10
+MAX_MISSES = 60
 DROP_ALT = 3.2
-VIRTUAL = False
+VIRTUAL = True
 range_finder_dist = None
-tracker_class = "van"
+tracker_class = ["van", "car"]
+BBOX_RADIUS_ADD = 25
+TAKEOFF_ALT = 15
 
 def setup_net():
     global net, output_layers, classes
@@ -255,7 +261,7 @@ def detect_objects(img):
             if confidence > CONF_THRESH:
                 # if it is what we're looking for
                 # if classes[class_id] == "people" or classes[class_id] == "pedestrian":
-                if classes[class_id] == tracker_class:
+                if classes[class_id] in tracker_class:
 
                     center_x, center_y, w, h = \
                         (detection[0:4] * np.array([FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2, FRAME_HORIZONTAL_CENTER * 2, FRAME_VERTICAL_CENTER * 2])).astype('int')
@@ -319,7 +325,6 @@ def determine_drone_actions(target_point, frame, target_sightings):
         dy = FRAME_VERTICAL_CENTER - float(target_point[1])
 
         logging.info(f"Anticipated change in position towards target: dx={dx}, dy={dy}")
-
 
         # Check to see if we're inside our safe zone relative to target...
         if (int(target_point[0]) - FRAME_HORIZONTAL_CENTER) ** 2 \
@@ -419,10 +424,15 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
 
     cx = int(x + w / 2)
     cy = int(y + h / 2)
-    cr = int(max(w, h) / 2)
+    cr = int(max(w, h) / 2) + BBOX_RADIUS_ADD
+    if cr + cy > FRAME_HEIGHT - 1 or cy - cr < 0:
+        cr = int(max(w, h) / 2)
+    if cr + cx > FRAME_WIDTH - 1 or cx - cr < 0:
+        cr = int(max(w, h) / 2)
 
     cropped = frame[cy - cr:cy + cr, cx - cr:cx + cr]
-    blank_image[y:y + cropped.shape[0], x:x + cropped.shape[1]] = cropped
+
+    blank_image[cy - cr:cy + cr, cx - cr:cx + cr] = cropped
 
     if VIRTUAL:
         cv2.imshow("cropped", blank_image)
@@ -435,9 +445,6 @@ def confirm_target_bbox(frame, b_box, net, classes, output_layers):
     center_x = x + int(b_box[2] / 2)
     center_y = y + int(b_box[3] / 2)
     if confidence is not None and confidence > .2:
-
-        cv2.rectangle(frame, (x, y), (x + int(b_box[2]), y + int(b_box[3])),
-                      (255, 0, 0), 2, 1)
         return True, (center_x, center_y)
     else:
         return False, (center_x, center_y)
@@ -454,7 +461,7 @@ def pixel_distance(widths):
     for width in widths:
         # formula for distance assumed width is 1 meter
         hypotenuse = (7.62 * assumed_width) / (width * ratio)
-        distance = get_ground_distance(hypotenuse) - DISTANCE_SUB
+        distance = get_ground_distance(hypotenuse)
         sum_distance += distance
 
     # calculate final distance in meters
@@ -485,14 +492,14 @@ def drop_off_sequence(lat, long, alt):
 
 
 def landing_sequence(widths, alts, lats, longs, headings):
-
+    global dummy_lat, dummy_long
     # calculate final distance using pixel
-    final_distance = pixel_distance(widths)
+    final_distance = pixel_distance(widths) - DISTANCE_SUB
 
     # if pixel calculations fail
     if range_finder_dist is not None:
         if range_finder_dist > 0.0:
-            final_distance = range_finder_dist
+            final_distance = range_finder_dist - DISTANCE_SUB
 
     # if both fail estimate
     if final_distance <= 0.0:
@@ -507,15 +514,44 @@ def landing_sequence(widths, alts, lats, longs, headings):
 
     drone_lib.log_activity("Going in for landing", log=log)
 
-
+    # calulate dummies location for add-on
+    dummy_lat, dummy_long = calc_new_location_to_target(lat, long, heading, final_distance + DISTANCE_SUB)
     # calculate final lat and long
     final_lat, final_long = calc_new_location_to_target(lat, long, heading, final_distance)
 
     # drop off sequence
     drop_off_sequence(final_lat, final_long, alts[0])
 
+    # add on
+    addon_sequence()
     # go home
     drone_lib.change_device_mode(drone, "RTL", log=log)
+
+
+def addon_sequence():
+    pt1 = calc_new_location_to_target(dummy_lat, dummy_long, 0, 10)
+    pt2 = calc_new_location_to_target(dummy_lat, dummy_long, 45, 10)
+    pt3 = calc_new_location_to_target(dummy_lat, dummy_long, 90, 10)
+    pt4 = calc_new_location_to_target(dummy_lat, dummy_long, 135, 10)
+    pt5 = calc_new_location_to_target(dummy_lat, dummy_long, 180, 10)
+    pt6 = calc_new_location_to_target(dummy_lat, dummy_long, 270, 10)
+
+    points_headings = [(pt1, 180), (pt2, 225), (pt3, 270), (pt4, 315), (pt5, 0), (pt6, 90)]
+    point_number = 1
+    for pairs in points_headings:
+        (lat, long), heading = pairs
+        drone_lib.goto_point(drone, lat, long, 1.5, 15, log=log)
+        while drone.airspeed > 0.1:
+            time.sleep(1)
+        drone_lib.condition_yaw(drone, heading, log=log)
+        time.sleep(5)
+        frame = get_cur_frame()
+        image_name = f"addon_{point_number}.png"
+        print(f"taking picture number {point_number}")
+        cv2.imwrite(os.path.join(IMG_SNAPSHOT_PATH, image_name), frame)
+        point_number += 1
+
+    return
 
 
 def conduct_mission():
@@ -578,10 +614,6 @@ def conduct_mission():
             # get initial object
             center, radius, b_box, confidence = check_for_initial_target(frame_copy)
             if confidence is not None and confidence > 0.2:
-                # draw bounding box on things
-                x = int(b_box[0])
-                y = int(b_box[1])
-                cv2.rectangle(frame, (x, y), (x + radius, y + radius), (20, 20, 230), 2)
 
                 # send to object tracker and change to guided mode
                 drone_lib.log_activity("Found target", log=log)
@@ -593,6 +625,9 @@ def conduct_mission():
             success, last_point = confirm_target_bbox(frame_copy, b_box, net, classes, output_layers)
             # record width
             width = b_box[2]
+            x = int(b_box[0])
+            y = int(b_box[1])
+            cv2.rectangle(frame, (x, y), (x + radius, y + radius), (20, 20, 230), 2)
             # if still tracking, mode and adjust until centered
             if success:
                 centered = determine_drone_actions(last_point, frame, target_sightings)
@@ -698,8 +733,6 @@ def main():
     # Create a message listener using the decorator.
     print(f"Finder above ground: {drone.rangefinder.distance}")
 
-    # Test latch - ensure open/close.
-    release_grip(2)
 
     # If the autopilot has no mission, terminate program
     drone.commands.download()
@@ -714,7 +747,7 @@ def main():
     drone_lib.arm_device(drone, log=log)
 
     # takeoff and climb 45 meters
-    drone_lib.device_takeoff(drone, 20, log=log)
+    drone_lib.device_takeoff(drone, TAKEOFF_ALT, log=log)
 
     try:
         # start mission
